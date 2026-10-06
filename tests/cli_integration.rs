@@ -392,6 +392,59 @@ mod search {
 
     #[test]
     #[serial]
+    fn index_crosses_embedding_batch_boundaries_without_losing_scenarios() {
+        ensure_model_cached();
+        let cache_dir = system_cache_dir();
+        let tmp = TempDir::new().unwrap();
+        let feature_dir = tmp.path().join("specs/search/batch-boundary");
+        fs::create_dir_all(&feature_dir).unwrap();
+        fs::copy(
+            "tests/fixtures/embedding_batches/specs/search/batch-boundary/spec.md",
+            feature_dir.join("spec.md"),
+        )
+        .unwrap();
+
+        cmd()
+            .current_dir(tmp.path())
+            .env("SPEQ_CACHE_DIR", &cache_dir)
+            .args(["search", "index"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Indexed 17 scenarios"));
+
+        let slug = tmp
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .replace('/', "-");
+        let index_path = Path::new(&cache_dir)
+            .join("indexes")
+            .join(format!("{slug}.idx"));
+        let bytes = fs::read(&index_path).unwrap();
+        fs::remove_file(&index_path).unwrap();
+        let index: speq_skill::search::SearchIndex = postcard::from_bytes(&bytes).unwrap();
+
+        let expected_names: Vec<String> = (1..=17)
+            .map(|number| format!("Scenario {number:02}"))
+            .collect();
+        let actual_names: Vec<&str> = index
+            .scenarios
+            .iter()
+            .map(|scenario| scenario.scenario.as_str())
+            .collect();
+
+        assert_eq!(actual_names, expected_names);
+        assert!(
+            index
+                .scenarios
+                .iter()
+                .all(|scenario| scenario.embedding.len() == 384)
+        );
+    }
+
+    #[test]
+    #[serial]
     fn search_finds_similar_scenarios() {
         ensure_model_cached();
         let tmp = setup_test_specs();

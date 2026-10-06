@@ -10,6 +10,9 @@ const MAX_SEQUENCE_LENGTH: usize = 512;
 /// Output dimensionality of the embedding model.
 const EMBEDDING_DIM: usize = 384;
 
+/// Maximum number of texts sent through the encoder at once.
+const EMBEDDING_BATCH_SIZE: usize = 8;
+
 /// ONNX embedder backed by the tract inference stack.
 pub struct Embedder {
     model: TypedRunnableModel<TypedModel>,
@@ -56,11 +59,23 @@ impl Embedder {
 
     /// Embed each input text into a 384-dimensional, L2-normalized vector.
     ///
-    /// Texts are tokenized individually with special tokens, truncated to 512
-    /// tokens, then padded to the longest sequence in the batch. The batched
-    /// tensors run through the encoder once; the CLS token of each row is
-    /// pooled and normalized so cosine similarity reduces to a dot product.
+    /// Texts are processed in bounded batches to keep inference memory usage
+    /// independent of the total number of scenarios being indexed.
     pub fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, String> {
+        let mut embeddings = Vec::with_capacity(texts.len());
+        for batch in embedding_batches(texts) {
+            embeddings.extend(self.embed_batch(batch)?);
+        }
+        Ok(embeddings)
+    }
+
+    /// Tokenize and embed one bounded batch.
+    ///
+    /// Texts are tokenized individually with special tokens, truncated to 512
+    /// tokens, then padded to the longest sequence in this batch. The tensors
+    /// run through the encoder once; the CLS token of each row is pooled and
+    /// normalized so cosine similarity reduces to a dot product.
+    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, String> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
@@ -120,6 +135,12 @@ impl Embedder {
     }
 }
 
+fn embedding_batches<'texts, 'content>(
+    texts: &'texts [&'content str],
+) -> std::slice::Chunks<'texts, &'content str> {
+    texts.chunks(EMBEDDING_BATCH_SIZE)
+}
+
 /// Widen tokenizer `u32` ids into the `i64` the ONNX graph expects.
 fn to_i64(values: &[u32]) -> Vec<i64> {
     values.iter().map(|&v| i64::from(v)).collect()
@@ -155,6 +176,25 @@ fn l2_normalize(v: &[f32]) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedding_batches_bound_peak_batch_size_without_reordering() {
+        let texts: Vec<String> = (0..(EMBEDDING_BATCH_SIZE * 2 + 1))
+            .map(|index| format!("scenario {index}"))
+            .collect();
+        let text_refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+
+        let batches: Vec<&[&str]> = embedding_batches(&text_refs).collect();
+
+        assert_eq!(
+            batches.iter().map(|batch| batch.len()).collect::<Vec<_>>(),
+            vec![EMBEDDING_BATCH_SIZE, EMBEDDING_BATCH_SIZE, 1]
+        );
+        assert_eq!(
+            batches.into_iter().flatten().copied().collect::<Vec<_>>(),
+            text_refs
+        );
+    }
 
     #[test]
     fn l2_normalize_scales_each_row_to_unit_length() {
